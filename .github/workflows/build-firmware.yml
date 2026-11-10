@@ -1,0 +1,208 @@
+name: Build SIBOAT firmware
+
+ 
+
+# Manual only: Actions tab > Build SIBOAT firmware > Run workflow.
+
+# There is deliberately no push trigger, so uploading files one by one never starts a half-finished build.
+
+on:
+
+  workflow_dispatch:
+
+ 
+
+permissions:
+
+  contents: read
+
+ 
+
+concurrency:
+
+  group: build-siboat-firmware
+
+  cancel-in-progress: true
+
+ 
+
+jobs:
+
+  build:
+
+    name: Build ${{ matrix.label }}
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 60
+
+    defaults:
+
+      run:
+
+        shell: bash
+
+    strategy:
+
+      fail-fast: false
+
+      matrix:
+
+        include:
+
+          - name: SIBOAT_MAIN-ESP32_FIRMWARE_FINAL_BOSS
+
+            label: Main ESP32
+
+            fqbn: esp32:esp32:esp32
+
+            ei: false
+
+          - name: SIBOAT_ESP32-CAM_FIRMWARE_FINAL_BOSS
+
+            label: ESP32-CAM
+
+            fqbn: esp32:esp32:esp32cam
+
+            ei: true
+
+    env:
+
+      NAME: ${{ matrix.name }}
+
+      DIR: build/${{ matrix.name }}
+
+ 
+
+    steps:
+
+      - uses: actions/checkout@v6
+
+ 
+
+      - name: Check the files and put the sketch in its own folder
+
+        run: |
+
+          for F in "$NAME.ino" siboat_main_types.h; do
+
+            test -s "$F" || { echo "::error::$F is missing from the repository root (file names are case sensitive)."; exit 1; }
+
+          done
+
+          grep -q 'ArduinoOTA.begin' "$NAME.ino" && grep -q 'ArduinoOTA.handle' "$NAME.ino" || { echo "::error::The OTA lines (ArduinoOTA.begin and ArduinoOTA.handle) are missing from $NAME.ino."; exit 1; }
+
+          mkdir -p "$DIR"
+
+          cp "$NAME.ino" siboat_main_types.h "$DIR/"
+
+          VER="$(grep -E '^#define (CAM_)?FW_VERSION ' "$NAME.ino" | head -1 | sed -E 's/^[^"]*"([^"]*)".*$/\1/')"
+
+          echo "FW_VERSION=${VER:-unknown}" >> "$GITHUB_ENV"
+
+ 
+
+      - name: Wi-Fi settings (siboat_secrets.h)
+
+        env:
+
+          SECRET: ${{ secrets.SIBOAT_SECRETS_H }}
+
+          PRIVATE: ${{ github.event.repository.private }}
+
+        run: |
+
+          if [ -z "$SECRET" ]; then
+
+            echo "::error::The repository secret SIBOAT_SECRETS_H is missing. Without it the board gets placeholder Wi-Fi settings and cannot join Wi-Fi. See README.md, step 4."
+
+            exit 1
+
+          fi
+
+          if [ "$PRIVATE" != "true" ]; then
+
+            echo "::error::This repository is public, so your Wi-Fi password is not embedded. Make the repository private (Settings > General > Danger Zone > Change visibility), then run again."
+
+            exit 1
+
+          fi
+
+          printf '%s\n' "$SECRET" | tr -d '\r' > "$DIR/siboat_secrets.h"
+
+          for N in SIBOAT_SSID1 SIBOAT_PASS1 SIBOAT_SSID2 SIBOAT_PASS2 SIBOAT_SSID3 SIBOAT_PASS3; do
+
+            grep -Eq "^[[:space:]]*#[[:space:]]*define[[:space:]]+$N[[:space:]]" "$DIR/siboat_secrets.h" || { echo "::error::The secret SIBOAT_SECRETS_H has no #define $N line."; exit 1; }
+
+          done
+
+          if grep -Eq '^[[:space:]]*#[[:space:]]*define[[:space:]]+SIBOAT_PASS1[[:space:]]+"(CHANGE_ME)?"' "$DIR/siboat_secrets.h"; then
+
+            echo "::error::SIBOAT_PASS1 is still CHANGE_ME or empty, so the board could not join Wi-Fi. Put the real Wi-Fi password in the secret."
+
+            exit 1
+
+          fi
+
+          if ! grep -Eq '^[[:space:]]*#[[:space:]]*define[[:space:]]+SIBOAT_BLE_PIN[[:space:]]+"[0-9]{4,8}"' "$DIR/siboat_secrets.h"; then
+
+            echo "::notice::SIBOAT_BLE_PIN is not a 4 to 8 digit number, so Bluetooth control stays OFF. Wi-Fi control is not affected."
+
+          fi
+
+ 
+
+      - uses: arduino/setup-arduino-cli@v2
+
+        with:
+
+          version: 1.5.1
+
+ 
+
+      - name: Install ESP32 core
+
+        run: |
+
+          URL=https://espressif.github.io/arduino-esp32/package_esp32_index.json
+
+          arduino-cli core update-index --additional-urls "$URL"
+
+          arduino-cli core install esp32:esp32@3.3.5 --additional-urls "$URL"
+
+ 
+
+      - name: Edge Impulse library (camera only)
+
+        if: matrix.ei
+
+        run: |
+
+          test -s siboat_inferencing.zip || { echo "::error::siboat_inferencing.zip is missing from the repository root (the camera AI model, exported from Edge Impulse as an Arduino library)."; exit 1; }
+
+          unzip -q siboat_inferencing.zip -d "$RUNNER_TEMP/ei"
+
+          PROP="$(find "$RUNNER_TEMP/ei" -name library.properties -print -quit)"
+
+          test -n "$PROP" || { echo "::error::library.properties was not found inside siboat_inferencing.zip. Export the Arduino library again from Edge Impulse."; exit 1; }
+
+          ROOT="$(dirname "$PROP")"
+
+          find "$ROOT" -name siboat_inferencing.h -print -quit | grep -q . || { echo "::error::siboat_inferencing.h was not found inside siboat_inferencing.zip."; exit 1; }
+
+          mkdir -p "$RUNNER_TEMP/siboat-libs/siboat_inferencing"
+
+          cp -a "$ROOT"/. "$RUNNER_TEMP/siboat-libs/siboat_inferencing/"
+
+ 
+
+      - name: Compile to .bin
+
+        run: |
+
+          LIBS=()
+
+          if [ "${{ matrix.ei }}" = "true" ]; then LIBS=(--libraries "$RUNNER_TEMP/siboat-libs"); fi
+
+          build() {
+
